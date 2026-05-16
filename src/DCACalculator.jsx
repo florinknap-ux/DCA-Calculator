@@ -56,8 +56,10 @@ function planCorrections(years, rng) {
 }
 
 // --- Simulation ---
-// Strategy: fixed reserve (e.g. €5.000) deployed at corrections, refilled when market returns to ATH
-// Comparison: pure DCA with same monthly amount
+// 3 strategies compared with same total capital (dca monthly + reserveSize):
+//   portDCA  = DCA only (no reserve, just dca/month)
+//   portLump = Lump sum: invest reserveSize in month 0 + dca/month (same capital, all-in)
+//   portRes  = Reserve strategy: dca/month + reserveSize deployed at corrections
 function runSim({ dca, reserveSize, years, seed, sp, stoxx, gold }) {
   const rng = createRng(seed)
   const N = years * 12
@@ -66,7 +68,6 @@ function runSim({ dca, reserveSize, years, seed, sp, stoxx, gold }) {
   const corrections = planCorrections(years, rng)
   const baseMonthly = (W.sp * sp + W.stoxx * stoxx + W.gold * gold) / 12
 
-  // Build monthly return series with structured corrections
   const monthReturns = new Array(N).fill(null).map(() => ({
     r: baseMonthly + 0.008 * normZ(rng), phase: "normal",
   }))
@@ -82,47 +83,42 @@ function runSim({ dca, reserveSize, years, seed, sp, stoxx, gold }) {
       monthReturns[m] = { r: recoveryR * (0.8 + 0.4 * rng()) + baseMonthly * 0.3, phase: "recovering" }
   })
 
-  let portDCA = 0             // pure DCA portfolio
-  let portRes = 0             // reserve strategy portfolio (invested part only)
-  let reserve = reserveSize   // cash reserve — starts full, deploys at corrections, refills at ATH
+  let portDCA  = 0             // pure DCA, no reserve
+  let portLump = reserveSize   // lump sum: reserve invested immediately from month 0
+  let portRes  = 0             // reserve strategy: DCA + reserve deployed at corrections
+  let reserve  = reserveSize
 
   let mkt = 1000, mktPeak = 1000, lvl = 0, cycleActive = false
-  let investedDCA = 0
-  let investedRes = reserveSize  // initial reserve counts as capital deployed
   let totalDeployed = 0
 
-  const deployEvents = []
-  const refillEvents = []
-  const hist = []
+  const deployEvents = [], refillEvents = [], hist = []
 
   for (let m = 0; m < N; m++) {
     const { r, phase } = monthReturns[m]
 
-    mkt     *= (1 + r)
-    portDCA  = portDCA * (1 + r) + dca
-    portRes  = portRes * (1 + r) + dca
-    investedDCA += dca
-    investedRes += dca
+    mkt      *= (1 + r)
+    portDCA   = portDCA  * (1 + r) + dca
+    portLump  = portLump * (1 + r) + dca   // reserve invested from day 0, grows with market
+    portRes   = portRes  * (1 + r) + dca
 
-    // New ATH → refill reserve if cycle was active (market recovered from correction)
+    // New ATH → refill reserve if a correction cycle was active
     if (mkt > mktPeak) {
       if (cycleActive && reserve < reserveSize) {
         const refillAmt = reserveSize - reserve
-        investedRes += refillAmt          // refill = new capital injected
-        reserve      = reserveSize
-        lvl          = 0
-        cycleActive  = false
+        reserve     = reserveSize
+        lvl         = 0
+        cycleActive = false
         refillEvents.push({ m, refillAmt })
       }
       mktPeak = mkt
     }
 
-    // Deploy reserve at correction thresholds
+    // Deploy from reserve at correction thresholds (fixed % of original reserveSize)
     const dd = mkt / mktPeak - 1
     for (let i = lvl; i < CORRECTION_RULES.length; i++) {
       if (dd <= CORRECTION_RULES[i].threshold && reserve > 0.01) {
         const amt = Math.min(reserve, reserveSize * CORRECTION_RULES[i].pct / 100)
-        portRes      += amt   // buy at discount
+        portRes      += amt
         reserve      -= amt
         totalDeployed += amt
         lvl           = i + 1
@@ -132,32 +128,19 @@ function runSim({ dca, reserveSize, years, seed, sp, stoxx, gold }) {
       }
     }
 
-    hist.push({
-      m,
-      dca: portDCA,
-      res: portRes + reserve,   // total wealth = invested portfolio + cash reserve
-      resPort: portRes,
-      reserveCash: reserve,
-      phase,
-    })
+    hist.push({ m, dca: portDCA, lump: portLump, res: portRes + reserve, phase })
   }
 
   const totalRefilled = refillEvents.reduce((s, e) => s + e.refillAmt, 0)
-  const extraInvested  = investedRes - investedDCA   // = reserveSize + totalRefilled (extra vs pure DCA)
-  const extraGain      = (portRes + reserve) - portDCA
 
   return {
     hist, corrections, deployEvents, refillEvents,
     dcaFinal:    portDCA,
+    lumpFinal:   portLump,
     resFinal:    portRes + reserve,
-    resPort:     portRes,
     reserveLeft: reserve,
-    investedDCA,
-    investedRes,
     totalDeployed,
     totalRefilled,
-    extraInvested,
-    extraGain,
     refillCount: refillEvents.length,
   }
 }
@@ -168,10 +151,12 @@ function fmtEur(v) {
   if (v >= 1e3) return `€${(v / 1e3).toFixed(0)}k`
   return `€${v.toFixed(0)}`
 }
-function niceTicks(max, n = 4) {
-  const mag  = Math.pow(10, Math.floor(Math.log10(max / n)))
-  const step = [1, 2, 5, 10].map(f => f * mag).find(f => max / f <= n + 1) || max / n
-  return Array.from({ length: Math.ceil(max / step) + 1 }, (_, i) => i * step)
+function niceTicks(min, max, n = 4) {
+  const range = max - min
+  const mag   = Math.pow(10, Math.floor(Math.log10(range / n)))
+  const step  = [1, 2, 5, 10].map(f => f * mag).find(f => range / f <= n + 1) || range / n
+  const start = Math.floor(min / step) * step
+  return Array.from({ length: Math.ceil((max - start) / step) + 2 }, (_, i) => start + i * step).filter(v => v >= min * 0.99 && v <= max * 1.01)
 }
 
 function Chart({ hist, deployEvents, refillEvents, years }) {
@@ -180,11 +165,16 @@ function Chart({ hist, deployEvents, refillEvents, years }) {
   const P = { t: 10, r: 10, b: 30, l: 52 }
   const PW = VW - P.l - P.r, PH = VH - P.t - P.b
   const N = hist.length
-  const yMax = Math.max(...hist.map(d => Math.max(d.dca, d.res))) * 1.06
-  const yTicks = niceTicks(yMax)
+
+  // Zoomed y-axis: don't start from 0, start near the minimum value
+  const allVals = hist.flatMap(d => [d.dca, d.lump, d.res])
+  const yMin = Math.min(...allVals) * 0.92
+  const yMax = Math.max(...allVals) * 1.05
+  const yTicks = niceTicks(yMin, yMax)
   const xTicks = Array.from({ length: years + 1 }, (_, i) => i)
+
   const tx = m => P.l + (m / (N - 1)) * PW
-  const ty = v => P.t + (1 - v / yMax) * PH
+  const ty = v => P.t + (1 - (v - yMin) / (yMax - yMin)) * PH
   const mkPath = fn => hist.map((d, i) => `${i ? "L" : "M"}${tx(i).toFixed(1)},${ty(fn(d)).toFixed(1)}`).join("")
 
   // Correction phase shading
@@ -196,8 +186,16 @@ function Chart({ hist, deployEvents, refillEvents, years }) {
   })
   if (rStart !== null) corrRects.push({ x1: tx(rStart), x2: tx(hist.length - 1) })
 
+  // Area between reserve and lump (green when reserve wins, red when lump wins)
+  const areaPath = [
+    ...hist.map((d, i) => `${i ? "L" : "M"}${tx(i).toFixed(1)},${ty(d.res).toFixed(1)}`),
+    ...hist.slice().reverse().map((d, i) => `L${tx(N-1-i).toFixed(1)},${ty(d.lump).toFixed(1)}`),
+    "Z"
+  ].join("")
+
   return (
     <svg viewBox={`0 0 ${VW} ${VH}`} className="w-full h-auto">
+      {/* Grid */}
       {yTicks.map(v => (
         <line key={v} x1={P.l} x2={P.l+PW} y1={ty(v)} y2={ty(v)} stroke="#1e2030" strokeWidth={1} />
       ))}
@@ -205,16 +203,13 @@ function Chart({ hist, deployEvents, refillEvents, years }) {
         <line key={y} x1={tx(y*12)} x2={tx(y*12)} y1={P.t} y2={P.t+PH} stroke="#1e2030" strokeWidth={1} />
       ))}
 
-      {/* Correction phase shading */}
+      {/* Correction shading */}
       {corrRects.map((r, i) => (
         <rect key={i} x={r.x1} width={Math.max(1, r.x2-r.x1)} y={P.t} height={PH} fill="#ef4444" fillOpacity={0.07} />
       ))}
 
-      {/* Area under reserve strategy */}
-      <path
-        d={`${mkPath(d => d.res)} L${tx(N-1).toFixed(1)},${(P.t+PH).toFixed(1)} L${tx(0).toFixed(1)},${(P.t+PH).toFixed(1)}Z`}
-        fill="#6366f1" fillOpacity={0.06}
-      />
+      {/* Area between reserve and lump sum — shows advantage/disadvantage */}
+      <path d={areaPath} fill="#6366f1" fillOpacity={0.12} />
 
       {/* Deploy markers */}
       {deployEvents.map((e, i) => (
@@ -222,24 +217,29 @@ function Chart({ hist, deployEvents, refillEvents, years }) {
           stroke={CORRECTION_RULES[e.lvl]?.color || "#ef4444"} strokeWidth={1.5} strokeDasharray="3,3" opacity={0.8} />
       ))}
 
-      {/* Refill markers (green triangles at top) */}
+      {/* Refill markers */}
       {refillEvents.map((e, i) => (
         <polygon key={i}
           points={`${tx(e.m)},${P.t+2} ${tx(e.m)-4},${P.t+10} ${tx(e.m)+4},${P.t+10}`}
           fill="#22c55e" opacity={0.7} />
       ))}
 
-      {/* DCA line */}
-      <path d={mkPath(d => d.dca)} fill="none" stroke="#22c55e" strokeWidth={2} />
+      {/* DCA pur (grey) */}
+      <path d={mkPath(d => d.dca)} fill="none" stroke="#475569" strokeWidth={1.5} strokeDasharray="4,2" />
 
-      {/* Reserve strategy line */}
+      {/* Lump sum (orange) */}
+      <path d={mkPath(d => d.lump)} fill="none" stroke="#f97316" strokeWidth={2} />
+
+      {/* Rezervă (indigo) */}
       <path d={mkPath(d => d.res)} fill="none" stroke="#6366f1" strokeWidth={2.5} />
 
+      {/* Y labels */}
       {yTicks.map(v => (
         <text key={v} x={P.l-4} y={ty(v)+4} textAnchor="end" fontSize={9} fill="#475569" fontFamily="monospace">
           {fmtEur(v)}
         </text>
       ))}
+      {/* X labels */}
       {xTicks.map(y => (
         <text key={y} x={tx(y*12)} y={VH-6} textAnchor="middle" fontSize={9} fill="#475569" fontFamily="monospace">
           {y === 0 ? "0" : `${y}a`}
@@ -295,13 +295,10 @@ export default function DCACalculator() {
     sp: cfg.sp, stoxx: cfg.stoxx, gold: cfg.gold,
   }), [dca, reserveSize, years, seed, scen]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const dcaGainPct  = ((sim.dcaFinal  - sim.investedDCA) / sim.investedDCA  * 100).toFixed(1)
-  const resGainPct  = ((sim.resFinal  - sim.investedRes) / sim.investedRes  * 100).toFixed(1)
-  const resWins     = sim.resFinal > sim.dcaFinal
-  // ROI pe capitalul EXTRA investit prin rezervă
-  const extraROI    = sim.extraInvested > 0
-    ? ((sim.extraGain / sim.extraInvested) * 100).toFixed(1)
-    : "—"
+  const capital     = dca * years * 12 + reserveSize   // total capital identic în toate strategiile
+  const resWinsLump = sim.resFinal > sim.lumpFinal
+  const vsLump      = sim.resFinal - sim.lumpFinal
+  const vsDCA       = sim.resFinal - sim.dcaFinal
 
   return (
     <div className="min-h-screen bg-[#12141c] text-slate-200 flex flex-col safe-top">
@@ -369,21 +366,22 @@ export default function DCACalculator() {
 
             {/* Chart */}
             <div className="bg-[#1a1c26] border border-[#2a2c3a] rounded-xl p-3">
-              <div className="flex gap-3 text-xs mb-2 flex-wrap">
+              <div className="flex gap-x-3 gap-y-1 text-xs mb-2 flex-wrap">
                 <span className="flex items-center gap-1">
                   <span className="w-3 h-0.5 bg-indigo-500 inline-block rounded" />
-                  <span className="text-slate-600">DCA + Rezervă €{fmtEur(reserveSize)}</span>
+                  <span className="text-slate-500">Rezervă {fmtEur(reserveSize)}</span>
                 </span>
                 <span className="flex items-center gap-1">
-                  <span className="w-3 h-0.5 bg-green-500 inline-block rounded" />
-                  <span className="text-slate-600">DCA pur €{dca}/lună</span>
+                  <span className="w-3 h-0.5 bg-orange-500 inline-block rounded" />
+                  <span className="text-slate-500">Lump sum (tot din ziua 1)</span>
                 </span>
                 <span className="flex items-center gap-1">
-                  <span className="w-2 h-2 border-t-2 border-l-2 border-r-2 border-green-500 inline-block" style={{clipPath:"polygon(50% 0,100% 100%,0 100%)"}} />
-                  <span className="text-slate-600">Rezervă reîncărcată</span>
+                  <span className="w-3 h-0.5 bg-slate-500 inline-block rounded" style={{borderTop:"1px dashed #475569",height:0}} />
+                  <span className="text-slate-600">DCA pur</span>
                 </span>
               </div>
               <Chart hist={sim.hist} deployEvents={sim.deployEvents} refillEvents={sim.refillEvents} years={years} />
+              <p className="text-xs text-slate-700 mt-1">Zona violet = avantaj rezervă vs lump sum</p>
             </div>
 
             {/* Reserve activity */}
@@ -427,46 +425,33 @@ export default function DCACalculator() {
             {/* Metrics */}
             <div className="grid grid-cols-2 gap-2">
               <div className="bg-[#1a1c26] border border-indigo-500/25 rounded-xl p-3">
-                <div className="text-xs text-slate-500 mb-1">DCA + Rezervă</div>
+                <div className="text-xs text-slate-500 mb-1">🟣 Rezervă {fmtEur(reserveSize)}</div>
                 <div className="text-lg font-mono font-bold text-indigo-400">{fmtEur(sim.resFinal)}</div>
-                <div className="text-xs text-slate-600 mt-1">
-                  investit: {fmtEur(sim.investedRes)}<br />
-                  (incl. {fmtEur(reserveSize + sim.totalRefilled)} rezerve)
-                </div>
-                <div className={`text-xs font-mono mt-1 ${+resGainPct >= 0 ? "text-indigo-400" : "text-red-400"}`}>
-                  {resGainPct}% pe capital investit
-                </div>
+                <div className="text-xs text-slate-600 mt-1">{sim.deployEvents.length} deploy-uri · {sim.refillCount} refill-uri</div>
+                <div className="text-xs font-mono mt-1 text-slate-600">deploiat: {fmtEur(sim.totalDeployed)}</div>
               </div>
 
-              <div className="bg-[#1a1c26] border border-green-500/20 rounded-xl p-3">
-                <div className="text-xs text-slate-500 mb-1">DCA Pur €{dca}/lună</div>
-                <div className="text-lg font-mono font-bold text-green-400">{fmtEur(sim.dcaFinal)}</div>
-                <div className="text-xs text-slate-600 mt-1">
-                  investit: {fmtEur(sim.investedDCA)}<br />
-                  fără rezervă
-                </div>
-                <div className={`text-xs font-mono mt-1 ${+dcaGainPct >= 0 ? "text-green-400" : "text-red-400"}`}>
-                  {dcaGainPct}% pe capital investit
-                </div>
+              <div className="bg-[#1a1c26] border border-orange-500/20 rounded-xl p-3">
+                <div className="text-xs text-slate-500 mb-1">🟠 Lump sum (tot din zi 1)</div>
+                <div className="text-lg font-mono font-bold text-orange-400">{fmtEur(sim.lumpFinal)}</div>
+                <div className="text-xs text-slate-600 mt-1">{fmtEur(reserveSize)} investit imediat</div>
+                <div className="text-xs font-mono mt-1 text-slate-600">+ €{dca}/lună DCA</div>
               </div>
 
               <div className="bg-[#1a1c26] border border-[#2a2c3a] rounded-xl p-3">
-                <div className="text-xs text-slate-500 mb-1">Capital extra rezervă</div>
-                <div className="text-lg font-mono font-bold text-slate-300">{fmtEur(sim.extraInvested)}</div>
-                <div className="text-xs text-slate-600 mt-1">
-                  {fmtEur(reserveSize)} inițial<br />
-                  + {fmtEur(sim.totalRefilled)} reîncărcări
-                </div>
+                <div className="text-xs text-slate-500 mb-1">⬛ DCA pur €{dca}/lună</div>
+                <div className="text-lg font-mono font-bold text-slate-400">{fmtEur(sim.dcaFinal)}</div>
+                <div className="text-xs text-slate-600 mt-1">fără rezervă</div>
+                <div className="text-xs font-mono mt-1 text-slate-600">+{fmtEur(vsDCA)} față de rezervă</div>
               </div>
 
-              <div className={`bg-[#1a1c26] border rounded-xl p-3 ${resWins ? "border-indigo-500/30" : "border-green-500/20"}`}>
-                <div className="text-xs text-slate-500 mb-1">Câștig extra rezervă</div>
-                <div className={`text-lg font-mono font-bold ${resWins ? "text-indigo-400" : "text-slate-500"}`}>
-                  {sim.extraGain >= 0 ? "+" : ""}{fmtEur(sim.extraGain)}
+              <div className={`bg-[#1a1c26] border rounded-xl p-3 ${resWinsLump ? "border-indigo-500/30" : "border-orange-500/30"}`}>
+                <div className="text-xs text-slate-500 mb-1">Rezervă vs Lump sum</div>
+                <div className={`text-lg font-mono font-bold ${resWinsLump ? "text-indigo-400" : "text-orange-400"}`}>
+                  {vsLump >= 0 ? "+" : ""}{fmtEur(vsLump)}
                 </div>
-                <div className="text-xs text-slate-600 mt-1">vs DCA pur</div>
-                <div className={`text-xs font-mono mt-1 ${sim.extraGain >= 0 ? "text-indigo-400" : "text-red-400"}`}>
-                  ROI pe capital extra: {extraROI}%
+                <div className="text-xs text-slate-600 mt-1">
+                  {resWinsLump ? "✅ Corecțiile au plătit" : "❌ Mai bine all-in din ziua 1"}
                 </div>
               </div>
             </div>
